@@ -32,6 +32,8 @@ import { mapBounded, pollDelay, scheduleAfter, settleChecks, StageBlockReads } f
 import { selectPriorityFee } from "./fees.js";
 import { startChainSignals } from "./chain-signals.js";
 import { LaunchPreparation } from "./launch-preparation.js";
+import { assertFreshLaunch, launchDeadline, LaunchFreshnessError } from "./launch-freshness.js";
+import { tokenSafetyEligibility } from "./token-safety.js";
 import {
   resolveApiLaunch,
   trustedUniswap,
@@ -65,6 +67,9 @@ export type ApiDependencies = {
     options?: { signal?: AbortSignal },
   ) => Promise<{ candidate: Candidate; deployment: Deployment }>;
 };
+export type ExecutionDependencies = {
+  now: () => number;
+};
 export class Engine {
   config: Config = loadConfig();
   running = false;
@@ -92,6 +97,7 @@ export class Engine {
   private effectiveConfig?: Config;
   private runConfig?: Config;
   private runAccount?: ReturnType<typeof privateKeyToAccount>;
+  private execution: ExecutionDependencies;
   private get settings(): Config {
     return (this.starting || this.running || this.busy) && this.runConfig
       ? this.runConfig
@@ -109,7 +115,9 @@ export class Engine {
   constructor(
     private readonly startFeed: typeof startLaunchFeed = startLaunchFeed,
     api: Partial<ApiDependencies> = {},
+    execution: Partial<ExecutionDependencies> = {},
   ) {
+    this.execution = { now: () => Date.now(), ...execution };
     this.api = {
       snapshot: fetchApiBaseline,
       resolve: resolveApiLaunch,
@@ -123,7 +131,7 @@ export class Engine {
         status: "pending",
         source: "api-baseline",
         detail:
-          "官方 API 自动发现模式；启动时记住现有项目，只处理之后新出现的 Ethereum 主网发行，无需填写合约和区块",
+          "官方 API 自动发现模式；启动时记住现有项目，只处理之后新出现且未过期的 Ethereum 主网发行，无需填写合约和区块",
       };
       return;
     }
@@ -608,10 +616,15 @@ export class Engine {
             });
             return;
           }
-          await this.handle(candidate, client, deployment, {
+          const rejection = await this.handle(candidate, client, deployment, {
             isCurrent: batchCurrent,
             refresh: refreshSnapshot,
           });
+          if (rejection) {
+            if (!active() || !batchCurrent()) return;
+            session.finish(item.id, rejection);
+            observedBatch.delete(item.id);
+          }
           // If a process exits before handle claims its journal, the pending candidate remains.
           // Once claimed, the durable journal prevents a second buy even before this write.
           if (!active()) {
@@ -834,6 +847,7 @@ export class Engine {
             maxBuyTaxBps: this.settings.maxBuyTaxBps,
             maxSellTaxBps: this.settings.maxSellTaxBps,
             minLiquidityEth: this.settings.minLiquidityEth,
+            maxLaunchAgeSeconds: this.settings.maxLaunchAgeSeconds,
           }),
         ),
       );
@@ -1023,15 +1037,26 @@ export class Engine {
         launchNumber: candidate.launchNumber,
         reason: rejected,
       });
-      return;
+      return rejected;
     }
     if (!this.running) return;
     const initialReads = new StageBlockReads();
-    const [launchBlock] = await settleChecks([
+    const [launchBlock, initialHead] = await settleChecks([
       initialReads.block(client, candidate.blockNumber),
+      initialReads.block(client),
       apiEvidence ? this.verifyApiEvidence(candidate, client, deployment, initialReads) : Promise.resolve(),
     ] as const);
     if (launchBlock.hash !== candidate.blockHash) throw Error("Launch reorged");
+    if (candidate.blockNumber > this.activationHead) {
+      try { assertFreshLaunch(launchBlock, initialHead, this.settings.maxLaunchAgeSeconds, this.execution.now()); }
+      catch (error) {
+        // Inconsistent RPC evidence is not proof of expiry. Keep the first
+        // candidate unresolved and stop rather than permanently skipping it.
+        if (!(error instanceof LaunchFreshnessError) || error.code !== "expired") throw error;
+        this.log("rejected", { token: candidate.token, launchNumber: candidate.launchNumber, reason: error.message });
+        return error.message;
+      }
+    }
     if (!this.running) return;
     if (candidate.blockNumber <= this.activationHead) {
       const reason = `启动前区块 ${candidate.blockNumber} 已有首个符合条件的发行；已错过，停止且不追买`;
@@ -1079,6 +1104,8 @@ export class Engine {
       ] as const);
       if (launchBlock.hash !== candidate.blockHash)
         throw Error("Launch reorged");
+      assertFreshLaunch(launchBlock, block, c.maxLaunchAgeSeconds, this.execution.now());
+      const deadline = launchDeadline(launchBlock, block, c.maxLaunchAgeSeconds, c.deadlineSeconds);
       // Initial IMD liquidity can be out of range at the opening tick. A zero active
       // liquidity read is not proof that the swap fails: the swap can cross a tick.
       const quote = await client.simulateContract({
@@ -1101,7 +1128,7 @@ export class Engine {
         candidate.pool,
         value,
         minOut,
-        block.timestamp + BigInt(c.deadlineSeconds),
+        deadline,
       );
       this.log("quote", {
         token: candidate.token,
@@ -1136,8 +1163,15 @@ export class Engine {
       if (apiEvidence) await this.verifyApiEvidence(candidate, client, deployment, new StageBlockReads());
       if (!this.running) throw Error("监听已停止");
       if (apiEvidence?.isCurrent && !apiEvidence.isCurrent()) throw Error("候选记录在交易准备期间改变，已停止");
+      // The advanced chain mode retains its reviewed-code policy. API mode
+      // verifies launch identity without requiring a manual token/Hook manifest.
+      const safetyHead = apiEvidence ? undefined : await client.getBlock();
+      if (safetyHead) {
+        const rejection = await tokenSafetyEligibility(candidate, { client, config: c, deployment }, safetyHead.number);
+        if (rejection) throw Error(rejection);
+      }
       const finalReads = new StageBlockReads();
-      const [finalHead, finalLaunch, finalQuote, nonce, pending, balance, chainId] = await settleChecks([
+      const [checkedHead, finalLaunch, finalQuote, nonce, pending, balance, chainId, finalSafety] = await settleChecks([
         finalReads.block(client),
         finalReads.block(client, candidate.blockNumber),
         finalReads.block(client, block.number),
@@ -1145,10 +1179,25 @@ export class Engine {
         client.getTransactionCount({ address: account.address, blockTag: "pending" }),
         client.getBalance({ address: account.address }),
         client.getChainId(),
+        safetyHead ? finalReads.block(client, safetyHead.number) : Promise.resolve(undefined),
       ] as const);
+      if (!this.running) throw Error("监听已停止");
+      // Nonce/balance/RPC fallbacks can span blocks. Refresh only after those
+      // checks settle, so fees and expiry use a current head rather than the
+      // snapshot that happened to finish first in the parallel batch.
+      const finalHead = await client.getBlock();
       if (chainId !== 1) throw Error("交易网络发生变化");
+      if (finalHead.number < checkedHead.number ||
+          (finalHead.number === checkedHead.number && finalHead.hash !== checkedHead.hash)) throw Error("最终链头发生重组或回退");
+      // A higher head can be on a different fork. Revalidate the previous
+      // snapshot's canonical anchor only when the chain has actually advanced.
+      if (finalHead.number > checkedHead.number &&
+          (await client.getBlock({ blockNumber: checkedHead.number })).hash !== checkedHead.hash)
+        throw Error("最终核验区块发生重组");
+      if (safetyHead && (finalSafety?.hash !== safetyHead.hash || finalHead.number < safetyHead.number)) throw Error("代币审核区块发生重组或链头回退");
       if (finalLaunch.hash !== candidate.blockHash || finalQuote.hash !== block.hash) throw Error("发币或报价区块发生重组");
-      if (finalHead.number < block.number || finalHead.timestamp >= block.timestamp + BigInt(c.deadlineSeconds)) throw Error("报价已过期");
+      assertFreshLaunch(finalLaunch, finalHead, c.maxLaunchAgeSeconds, this.execution.now());
+      if (finalHead.number < block.number || finalHead.timestamp >= deadline || BigInt(Math.floor(this.execution.now() / 1000)) >= deadline) throw Error("报价已过期");
       if (nonce !== pending) throw Error("钱包有未完成交易，请使用独立钱包");
       if (balance < value + worstGas) throw Error("余额不足以覆盖买入和最高 Gas");
       const fee = selectPriorityFee({
@@ -1159,6 +1208,7 @@ export class Engine {
       this.log("fee_selected", { strategy: c.feeStrategy, source: fee.source, priorityWei: maxPriorityFeePerGas.toString(), capped: fee.capped });
       if (!this.running) throw Error("监听已停止");
       if (apiEvidence?.isCurrent && !apiEvidence.isCurrent()) throw Error("候选记录在最终核验期间改变，已停止");
+      assertFreshLaunch(finalLaunch, finalHead, c.maxLaunchAgeSeconds, this.execution.now());
       const raw = await account.signTransaction({
         chainId: 1,
         type: "eip1559",
@@ -1176,13 +1226,15 @@ export class Engine {
       if (!this.running) throw Error("停止发生在签名之后，需核对日志");
       if (apiEvidence?.isCurrent && !apiEvidence.isCurrent())
         throw Error("候选记录在签名期间改变，禁止广播");
+      assertFreshLaunch(finalLaunch, finalHead, c.maxLaunchAgeSeconds, this.execution.now());
+      if (BigInt(Math.floor(this.execution.now() / 1000)) >= deadline) throw Error("报价已过期，禁止广播");
       // Identical signed payload / nonce to every checked RPC, never multiple buys.
+      // Do not add a relay-only next-block cutoff: slow reads or a missed block
+      // must not invalidate an otherwise fresh transaction before it is sent.
       try {
         await Promise.any(
           c.rpcHttpUrls.map(async (url) => {
-            const hash = await this.client(url).sendRawTransaction({
-              serializedTransaction: raw,
-            });
+            const hash = await this.client(url).sendRawTransaction({ serializedTransaction: raw });
             if (hash !== txHash) throw Error("Hash mismatch");
             return hash;
           }),
@@ -1228,7 +1280,7 @@ export class Engine {
       if (phase === "claimed")
         this.journal!.update({
           phase: "failed",
-          reason: "首个候选预检或模拟失败，停止交易；检查余额、Gas 和池状态",
+          reason: e instanceof LaunchFreshnessError ? e.message : "首个候选预检或报价失败，停止交易；检查余额、Gas 和池状态",
         });
       else if (phase === "signed" || phase === "broadcast")
         this.journal!.update({

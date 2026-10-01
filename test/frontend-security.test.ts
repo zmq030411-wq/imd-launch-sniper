@@ -276,6 +276,7 @@ test("server startup and wallet changes lock controls and invalidate a previous 
 test("live submission binds the exact displayed budget and public wallet that were confirmed", async () => {
   const ui = frontend();
   ui.input("buyAmountEth", "0.02");
+  ui.input("maxLaunchAgeSeconds", "60");
   ui.approve();
   let accepted = configSchema.parse({});
   ui.setTransport(async (path, init) => {
@@ -288,6 +289,7 @@ test("live submission binds the exact displayed budget and public wallet that we
       assert.equal(body.mode, "live");
       assert.deepEqual(body.expectedConfig, accepted);
       assert.equal(body.expectedConfig.buyAmountEth, "0.02");
+      assert.equal(body.expectedConfig.maxLaunchAgeSeconds, 60);
       assert.equal(body.expectedConfig.taxCheck, "off");
       assert.equal(body.expectedWalletAddress, addressA);
       return Response.json({ ok: true });
@@ -343,20 +345,82 @@ test("wallet changes during saving retain the originally confirmed address and s
   assert.equal(ui.calls.filter((call) => call.path === "/api/start").length, 1);
 });
 
-test("the product exposes only explicit live execution and API tax limits cannot imply active checking", () => {
-  const ui = frontend();
+test("API mode preserves inactive tax and Hook settings and clearly marks them as unchecked", () => {
+  const saved = configSchema.parse({ maxBuyTaxBps: 125, maxSellTaxBps: 250, allowedHooks: [addressB] });
+  const ui = frontend(fixtureStatus(saved));
   assert(!ui.nodes.has("dry-run-button"));
   assert(!ui.nodes.has("taxCheck"));
   assert.equal(ui.exports.collect!().taxCheck, "off");
-  assert.equal(ui.nodes.get("maxBuyTaxBps")!.disabled, true);
-  assert.match(ui.nodes.get("tax-check-detail")!.textContent, /未检测/);
+  for (const id of ["maxBuyTaxBps", "maxSellTaxBps", "allowedHooks"])
+    assert.equal(ui.nodes.get(id)!.disabled, true);
+  assert.equal(ui.nodes.get("hook-whitelist-field")!.hidden, true);
+  assert.match(ui.nodes.get("tax-check-detail")!.textContent, /税率未检测/);
+  assert.match(ui.nodes.get("tax-check-detail")!.textContent, /阈值不生效/);
+  assert.match(ui.nodes.get("tax-check-detail")!.textContent, /不进行买卖模拟/);
+  assert.match(ui.nodes.get("discovery-detail")!.textContent, /无需手填/);
+  assert.match(ui.nodes.get("discovery-detail")!.textContent, /提前启动等待主网上线/);
+  // Inactive DOM values must not replace the saved advanced-mode policy.
+  ui.nodes.get("maxBuyTaxBps")!.value = "49";
+  ui.nodes.get("maxSellTaxBps")!.value = "49";
+  ui.nodes.get("allowedHooks")!.value = addressA;
+  const collected = ui.exports.collect!();
+  assert.equal(collected.maxBuyTaxBps, 125);
+  assert.equal(collected.maxSellTaxBps, 250);
+  assert.deepEqual(Array.from(collected.allowedHooks), [addressB]);
+  assert(!html.includes("/Users/"));
+});
+
+test("advanced chain mode enables explicit reviewed tax limits and the Hook allowlist", () => {
+  const ui = frontend();
   ui.input("discoverySource", "chain");
-  assert.equal(ui.nodes.get("maxBuyTaxBps")!.disabled, false);
+  for (const id of ["maxBuyTaxBps", "maxSellTaxBps", "allowedHooks"])
+    assert.equal(ui.nodes.get(id)!.disabled, false);
+  assert.equal(ui.nodes.get("hook-whitelist-field")!.hidden, false);
+  ui.input("maxBuyTaxBps", "1.25");
+  ui.input("maxSellTaxBps", "2.50");
+  ui.input("allowedHooks", addressB);
+  const collected = ui.exports.collect!();
+  assert.equal(collected.maxBuyTaxBps, 125);
+  assert.equal(collected.maxSellTaxBps, 250);
+  assert.deepEqual(Array.from(collected.allowedHooks), [addressB]);
   assert.match(
     ui.nodes.get("tax-check-detail")!.textContent,
     /已审核的固定税率/,
   );
-  assert(!html.includes("/Users/"));
+  assert.match(ui.nodes.get("tax-check-detail")!.textContent, /不保证未来可卖出/);
+});
+
+test("the launch age limit has a bounded default and changes invalidate live approval", async () => {
+  const ui = frontend();
+  assert.match(html, /交易有效期也不会晚于此上限/);
+  assert.equal(ui.nodes.get("maxLaunchAgeSeconds")!.value, "120");
+  assert.equal(ui.exports.collect!().maxLaunchAgeSeconds, 120);
+  for (const value of ["11", "301", "12.5", ""]) {
+    ui.nodes.get("maxLaunchAgeSeconds")!.value = value;
+    assert.throws(() => ui.exports.collect!());
+  }
+  for (const value of ["12", "300"]) {
+    ui.input("maxLaunchAgeSeconds", value);
+    assert.equal(ui.exports.collect!().maxLaunchAgeSeconds, Number(value));
+  }
+  ui.approve();
+  assert.equal(ui.nodes.get("live-consent")!.checked, true);
+  ui.input("maxLaunchAgeSeconds", "60");
+  assert.equal(ui.nodes.get("live-consent")!.checked, false);
+  ui.approve();
+  ui.nodes.get("maxLaunchAgeSeconds")!.value = "90";
+  await ui.start();
+  assert.equal(ui.calls.some((call) => call.path === "/api/start" || call.path === "/api/config"), false);
+  assert.match(ui.nodes.get("feedback")!.textContent, /配置已变化/);
+});
+
+test("execution copy describes one signed transaction sent to multiple public RPCs", () => {
+  assert.match(html, /广播同时发送同一笔签名交易/);
+  assert.match(html, /不重签或追加买入/);
+  assert.match(html, /不保证首买或成交/);
+  assert(!html.includes("Flashbots"));
+  assert(!html.includes("私有提交"));
+  assert(!script.includes("私有交易已提交"));
 });
 
 function deferred<T>() {

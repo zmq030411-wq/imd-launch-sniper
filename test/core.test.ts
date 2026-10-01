@@ -220,6 +220,30 @@ test("launch number and deployment block filters exclude historical launches", a
   );
 });
 
+test("advanced chain policy preserves its historical filters before token code reads", async () => {
+  let codeReads = 0;
+  const ctx = context({
+    config: configSchema.parse({ discoverySource: "chain", startBlock: "100", minLaunchNumber: 2 }),
+    client: { getCode: async () => { codeReads++; return bytecode; } } as unknown as PublicClient,
+  });
+  assert.match((await eligibility(candidate({ launchNumber: 1 }), ctx))!, /早于起点/);
+  assert.match((await eligibility(candidate({ blockNumber: 99n, launchNumber: 2 }), ctx))!, /早于起点/);
+  assert.equal(codeReads, 0);
+  assert.equal(await eligibility(candidate({ launchNumber: 2 }), ctx), null);
+  assert.equal(codeReads, 1);
+});
+
+test("advanced chain policy rejects conflicting reviews and standardized delegation wrappers", async () => {
+  const ctx = context({ config: configSchema.parse({ discoverySource: "chain" }) });
+  ctx.deployment.taxPolicies.push({ ...ctx.deployment.taxPolicies[0]!, sellTaxBps: 1 });
+  assert.match((await eligibility(candidate(), ctx))!, /审核证据冲突/);
+
+  const wrapper: Hex = `0x363d3d373d3d3d363d73${"77".repeat(20)}5af43d82803e903d91602b57fd5bf3`;
+  ctx.deployment.taxPolicies = [{ ...ctx.deployment.taxPolicies[0]!, tokenCodeHash: keccak256(wrapper) }];
+  ctx.client = { getCode: async () => wrapper } as unknown as PublicClient;
+  assert.match((await eligibility(candidate(), ctx))!, /使用委托代码/);
+});
+
 test("configuration prohibits unknown-tax overrides, unsafe slippage and mixed fee caps", () => {
   assert.equal(
     configSchema.safeParse({ unknownTaxPolicy: "allow" }).success,
@@ -606,7 +630,7 @@ test(
           return { result: [1_000_000n, 50_000n] };
         },
       });
-      const engine = new Engine(() => () => {});
+      const engine = new Engine(() => () => {}, {}, { now: () => 1_800_000_000_000 });
       engine.config = configSchema.parse({
         discoverySource: "chain",
         startBlock: "100",
@@ -718,7 +742,7 @@ test(
           blockNumber: 101n,
         }),
       });
-      const engine = new Engine(() => () => {});
+      const engine = new Engine(() => () => {}, {}, { now: () => 1_800_000_000_000 });
       engine.config = configSchema.parse({
         discoverySource: "chain",
         startBlock: "100",

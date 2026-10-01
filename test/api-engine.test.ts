@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { setImmediate } from "node:timers";
-import { keccak256, parseEther, parseTransaction, recoverTransactionAddress, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
+import { keccak256, decodeFunctionData, parseEther, parseTransaction, recoverTransactionAddress, zeroAddress, type Address, type Hex, type PublicClient } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { Engine, type ApiDependencies } from "../src/engine.js";
 import { configSchema, type Config, type Deployment } from "../src/config.js";
@@ -13,7 +13,7 @@ import { ApiLaunchError, trustedUniswap } from "../src/api-launch.js";
 import { ApiSession, ApiHttpError } from "../src/api-session.js";
 import type { LaunchHint, LaunchSnapshot } from "../src/launch-feed.js";
 import { Journal } from "../src/journal.js";
-import { poolId } from "../src/v4.js";
+import { poolId, routerAbi } from "../src/v4.js";
 import type { Candidate, PoolKey } from "../src/types.js";
 
 const key = `0x${"11".repeat(32)}` as Hex;
@@ -41,6 +41,8 @@ async function advance(t: TestContext, milliseconds = 1000) { t.mock.timers.tick
 
 class Fixture {
   head = 100n;
+  nowMs?: number;
+  baseFees = new Map<bigint, bigint>();
   rows: LaunchHint[] = [];
   snapshots = 0;
   cacheMaxAgeSeconds: number | null = null;
@@ -61,7 +63,7 @@ class Fixture {
     getBlockNumber: async () => this.head,
     getBlock: async ({ blockNumber }: { blockNumber?: bigint } = {}) => {
       const number = blockNumber ?? this.head;
-      return { number, hash: this.forkHashes.get(number) ?? blockHash(number), timestamp: 1_800_000_000n + 12n * number, baseFeePerGas: 1_000_000_000n };
+      return { number, hash: this.forkHashes.get(number) ?? blockHash(number), timestamp: 1_800_000_000n + 12n * number, baseFeePerGas: this.baseFees.get(number) ?? 1_000_000_000n };
     },
     getCode: async ({ address: target }: { address: Address }) => {
       const pinned = this.protocolCode[target.toLowerCase()];
@@ -94,7 +96,9 @@ class Fixture {
       },
 
     };
-    const engine = new Engine(() => () => {}, api);
+    const engine = new Engine(() => () => {}, api, {
+      now: () => this.nowMs ?? Number(1_800_000_000n + 12n * this.head) * 1000,
+    });
     engine.config = configSchema.parse({ rpcHttpUrls: ["https://fixture.invalid"], rpcWsUrls: [], pollIntervalMs: 1000, ...config });
     engine.client = () => this.client;
     this.engines.push(engine);
@@ -701,5 +705,218 @@ test("maximum safe Retry-After cannot overflow the mainnet cooldown deadline", a
     engine.stop(); await advance(t, 60_000);
     assert.equal(f.snapshots, snapshots);
     assert.deepEqual(f.broadcasts, []);
+  });
+});
+
+test("two-hour delayed launch is durably rejected without quoting or signing", async t => {
+  await isolated(t, async f => {
+    const engine = f.create(); await engine.start("live");
+    f.publish(1, 101n); f.head = 701n; await advance(t);
+    assert.equal(f.quotes.length, 0); assert.equal(f.broadcasts.length, 0);
+    assert.match(new ApiSession("live").state!.decisions[launchId(1)]!, /时效上限/);
+    engine.stop();
+    const restarted = f.create(); await restarted.start("live"); await advance(t);
+    assert.equal(f.broadcasts.length, 0);
+    assert.equal(new ApiSession("live").pending().length, 0);
+  });
+});
+
+test("wall clock rejects stale launch even if the RPC head is frozen", async t => {
+  await isolated(t, async f => {
+    const engine = f.create(); await engine.start("live"); f.publish();
+    f.nowMs = Number(1_800_000_000n + 12n * 101n + 121n) * 1000;
+    await advance(t);
+    assert.equal(f.broadcasts.length, 0);
+    assert.match(new ApiSession("live").state!.decisions[launchId(1)]!, /时效上限/);
+  });
+});
+
+test("a temporarily lagging admission head cannot permanently reject the first launch or buy the second", async t => {
+  await isolated(t, async f => {
+    const engine = f.create(); await engine.start("live");
+    f.publish(1, 101n); f.publish(2, 102n);
+    const getBlock = f.client.getBlock;
+    let lagged = false;
+    f.client.getBlock = (async (args?: Parameters<typeof getBlock>[0]) => {
+      if (!lagged && args?.blockNumber === undefined) {
+        lagged = true;
+        return getBlock({ blockNumber: 100n });
+      }
+      return getBlock(args);
+    }) as typeof getBlock;
+    await advance(t);
+    assert.equal(lagged, true);
+    assert.equal(engine.running, false);
+    assert.equal(engine.state.phase, "failed");
+    const session = new ApiSession("live");
+    assert.equal(session.state!.decisions[launchId(1)], undefined);
+    assert.deepEqual(session.pending().map(row => row.id).sort(), [launchId(1), launchId(2)]);
+    assert.equal(new Journal().state.phase, "idle");
+    assert.deepEqual(f.quotes, []); assert.deepEqual(f.broadcasts, []);
+    await advance(t, 6000);
+    assert.deepEqual(f.broadcasts, []);
+  });
+});
+
+test("launch expiry during gas preparation consumes the claim without submission or retry", async t => {
+  await isolated(t, async f => {
+    f.client.estimateGas = (async () => { f.head += 11n; return 100_000n; }) as typeof f.client.estimateGas;
+    const engine = f.create(); await engine.start("live"); f.publish(); await advance(t);
+    assert.equal(engine.state.phase, "failed");
+    assert.match(String(engine.state.reason), /时效上限/);
+    assert.equal(f.broadcasts.length, 0);
+    await assert.rejects(f.create().start("live"), /实盘检查未通过/);
+  });
+});
+
+test("fresh launch transaction expires no later than launch lifetime", async t => {
+  await isolated(t, async f => {
+    const engine = f.create(); await engine.start("live"); f.publish(); f.head = 109n; await advance(t);
+    assert.equal(engine.state.phase, "confirmed", JSON.stringify(engine.logs));
+    assert.equal(f.broadcasts.length, 1);
+    const signed = parseTransaction(f.broadcasts[0]!);
+    const decoded = decodeFunctionData({ abi: routerAbi, data: signed.data! });
+    assert.equal(decoded.args[2], 1_800_000_000n + 12n * 101n + 120n);
+  });
+});
+
+
+test("API can arm before a mainnet manifest and buy a resolver-verified new Hook without manual allowlisting", async t => {
+  await isolated(t, async f => {
+    const engine = f.create({ allowedHooks: [], allowedKinds: ["univ4_hook"] });
+    assert.equal(existsSync("config/mainnet.json"), false);
+    await engine.start("live");
+    assert.equal(engine.running, true);
+    const launch = candidate();
+    launch.kind = "univ4_hook";
+    launch.pool = {...launch.pool, hooks: address("d")};
+    launch.poolId = poolId(launch.pool);
+    f.publish();
+    f.launches.set(launchId(1), launch);
+    f.rows[0]!.kind = "univ4_hook";
+    await advance(t);
+    assert.deepEqual(f.resolutions, [launchId(1)], "automatic official identity verification still runs");
+    assert.equal(engine.state.phase, "confirmed", JSON.stringify(engine.logs));
+    assert.equal(f.broadcasts.length, 1);
+    assert.ok(parseTransaction(f.broadcasts[0]!).data!.toLowerCase().includes(address("d").slice(2)));
+    assert.equal(existsSync("config/mainnet.json"), false);
+  });
+});
+
+for (const nextHead of [102n, 103n]) test(`slow final nonce reads refresh head ${nextHead}, then sign once and broadcast identical bytes in parallel`, async t => {
+  await isolated(t, async f => {
+    let releaseNonce!: () => void, releaseSlowBroadcast!: () => void;
+    const nonceGate = new Promise<void>(resolve => { releaseNonce = resolve; });
+    const broadcastGate = new Promise<void>(resolve => { releaseSlowBroadcast = resolve; });
+    let nonceReads = 0, nonceReleased = false;
+    const observedHeads: bigint[] = [];
+    const getBlock = f.client.getBlock;
+    f.client.getBlock = (async (args?: Parameters<typeof getBlock>[0]) => {
+      const block = await getBlock(args);
+      if (nonceReleased && args?.blockNumber === undefined) observedHeads.push(block.number!);
+      return block;
+    }) as typeof getBlock;
+    f.client.getTransactionCount = (async () => { nonceReads++; await nonceGate; return 0; }) as typeof f.client.getTransactionCount;
+    f.client.sendRawTransaction = (async ({serializedTransaction}: {serializedTransaction: Hex}) => {
+      f.broadcasts.push(serializedTransaction);
+      if (f.broadcasts.length === 1) await broadcastGate;
+      return keccak256(serializedTransaction);
+    }) as typeof f.client.sendRawTransaction;
+    const newBaseFee = nextHead === 102n ? 2_800_000_000n : 2_900_000_000n;
+    f.baseFees.set(nextHead, newBaseFee);
+    const engine = f.create({ rpcHttpUrls: ["https://fixture-a.invalid", "https://fixture-b.invalid"],
+      maxFeeGwei: "3", priorityFeeGwei: "2", feeStrategy: "competitive" });
+    await engine.start("live");
+    // Only the public, unfunded fixture account is observed; no real wallet is used.
+    const account = (engine as unknown as {runAccount: ReturnType<typeof privateKeyToAccount>}).runAccount;
+    const sign = t.mock.method(account, "signTransaction");
+    try {
+      f.publish(); await advance(t);
+      assert.equal(nonceReads, 2);
+      assert.equal(sign.mock.callCount(), 0);
+      assert.deepEqual(f.broadcasts, []);
+      f.head = nextHead;
+      nonceReleased = true; releaseNonce(); await settle();
+      assert.equal(engine.state.phase, "confirmed", JSON.stringify(engine.logs));
+      assert.ok(observedHeads.includes(nextHead), "getBlock must run after the slow nonce batch completes");
+      assert.equal(sign.mock.callCount(), 1);
+      assert.equal(f.broadcasts.length, 2, "the second provider must finish while the first send is still pending");
+      assert.equal(new Set(f.broadcasts).size, 1);
+      const signed = parseTransaction(f.broadcasts[0]!);
+      assert.equal(signed.nonce, 0);
+      assert.equal(signed.maxPriorityFeePerGas, 3_000_000_000n - newBaseFee, "tip headroom must use the refreshed base fee");
+      assert.equal(signed.maxFeePerGas, 3_000_000_000n);
+      assert.ok(signed.gas! * signed.maxFeePerGas! <= parseEther(engine.config.maxGasEth));
+      assert.equal(signed.value, parseEther("0.01"));
+      await advance(t, 6000);
+      assert.equal(sign.mock.callCount(), 1); assert.equal(f.broadcasts.length, 2);
+      await assert.rejects(engine.start("live"));
+    } finally { releaseNonce(); releaseSlowBroadcast(); await settle(); }
+  });
+});
+
+test("a deadline that expires during the final nonce batch prevents any signature or public broadcast", async t => {
+  await isolated(t, async f => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let nonceReads = 0;
+    f.client.getTransactionCount = (async () => { nonceReads++; await gate; return 0; }) as typeof f.client.getTransactionCount;
+    const engine = f.create({deadlineSeconds: 20, maxLaunchAgeSeconds: 300});
+    await engine.start("live");
+    const account = (engine as unknown as {runAccount: ReturnType<typeof privateKeyToAccount>}).runAccount;
+    const sign = t.mock.method(account, "signTransaction");
+    try {
+      f.publish(); await advance(t); assert.equal(nonceReads, 2);
+      f.head = 103n; // 24 seconds after the launch: young enough, but the quote deadline has expired.
+      release(); await settle();
+      assert.equal(engine.state.phase, "failed", JSON.stringify(engine.logs));
+      assert.equal(sign.mock.callCount(), 0); assert.deepEqual(f.broadcasts, []);
+      assert.equal(new Journal().state.txHash, undefined);
+      await advance(t, 6000); assert.deepEqual(f.broadcasts, []);
+      await assert.rejects(f.create().start("live"), /实盘检查未通过/);
+    } finally { release(); await settle(); }
+  });
+});
+
+test("an uncertain public broadcast retains one raw transaction and never retries the consumed attempt", async t => {
+  await isolated(t, async f => {
+    f.client.sendRawTransaction = (async ({serializedTransaction}: {serializedTransaction: Hex}) => {
+      f.broadcasts.push(serializedTransaction); throw Error("fixture transport response lost");
+    }) as typeof f.client.sendRawTransaction;
+    const engine = f.create({rpcHttpUrls: ["https://fixture-a.invalid", "https://fixture-b.invalid"]});
+    await engine.start("live");
+    const account = (engine as unknown as {runAccount: ReturnType<typeof privateKeyToAccount>}).runAccount;
+    const sign = t.mock.method(account, "signTransaction");
+    f.publish(); await advance(t);
+    assert.equal(engine.state.phase, "uncertain");
+    assert.equal(sign.mock.callCount(), 1); assert.equal(f.broadcasts.length, 2);
+    assert.equal(new Set(f.broadcasts).size, 1);
+    await advance(t, 6000); await assert.rejects(f.create().start("live"), /实盘检查未通过/);
+    assert.equal(sign.mock.callCount(), 1); assert.equal(f.broadcasts.length, 2);
+  });
+});
+
+for (const refreshedHead of [101n, 102n]) test(`a reorg during slow nonce reads is rejected when refreshed head is ${refreshedHead}`, async t => {
+  await isolated(t, async f => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let nonceReads = 0;
+    f.client.getTransactionCount = (async () => { nonceReads++; await gate; return 0; }) as typeof f.client.getTransactionCount;
+    const engine = f.create(); await engine.start("live");
+    const account = (engine as unknown as {runAccount: ReturnType<typeof privateKeyToAccount>}).runAccount;
+    const sign = t.mock.method(account, "signTransaction");
+    try {
+      f.publish(); await advance(t);
+      assert.equal(nonceReads, 2); assert.equal(sign.mock.callCount(), 0);
+      // Earlier launch/quote reads still refer to the original block 101. A
+      // numerically newer head alone cannot prove those reads remain canonical.
+      f.forkHashes.set(101n, blockHash(101n, 77));
+      f.head = refreshedHead;
+      release(); await settle();
+      assert.equal(engine.state.phase, "failed", JSON.stringify(engine.logs));
+      assert.equal(sign.mock.callCount(), 0); assert.deepEqual(f.broadcasts, []);
+      assert.equal(new Journal().state.txHash, undefined);
+      await advance(t, 6000); assert.deepEqual(f.broadcasts, []);
+    } finally { release(); await settle(); }
   });
 });

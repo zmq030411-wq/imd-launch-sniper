@@ -12,6 +12,7 @@
   ];
   const integerFields = [
     "minLaunchNumber",
+    "maxLaunchAgeSeconds",
     "deadlineSeconds",
     "pollIntervalMs",
   ];
@@ -27,6 +28,7 @@
     maxGasEth: "0.005",
     minLiquidityEth: "0",
     minLaunchNumber: 1,
+    maxLaunchAgeSeconds: 120,
     deadlineSeconds: 60,
     pollIntervalMs: 2000,
     slippageBps: 300,
@@ -319,8 +321,10 @@
     for (const field of integerFields) {
       config[field] = Number($(field).value);
       if (!Number.isSafeInteger(config[field]))
-        throw new Error("编号、有效期和轮询间隔必须为整数。");
+        throw new Error("编号、时限和轮询间隔必须为整数。");
     }
+    if (config.maxLaunchAgeSeconds < 12 || config.maxLaunchAgeSeconds > 300)
+      throw new Error("最大发射时间差必须为 12 至 300 秒。");
     for (const field of percentFields)
       config[field] = inactiveField(field)
         ? (savedConfig?.[field] ?? defaults[field])
@@ -446,7 +450,6 @@
 
   function renderModeSettings() {
     const api = $("discoverySource").value === "api";
-    const taxOff = api;
     const locked = busy || stopping || configurationLocked() || !loaded;
     const manual = !api && $("startBlockMode").value === "manual";
     $("hook-whitelist-field").hidden = api;
@@ -462,11 +465,11 @@
       "maxSellTaxBps",
     ])
       $(id).disabled = locked || inactiveField(id);
-    $("tax-check-note").classList.toggle("tax-off", taxOff);
-    $("tax-check-symbol").textContent = taxOff ? "!" : "✓";
-    $("tax-check-detail").textContent = !api
-      ? "链上合约监听模式使用已审核的固定税率证据。买入与卖出税率均须通过限制，税率未知时跳过。"
-      : "买卖税率未检测（不进行买卖模拟），卖出能力未验证，以上阈值不生效。仍按金额、Gas、池报价滑点与其他链上校验执行。";
+    $("tax-check-note").classList.toggle("tax-off", api);
+    $("tax-check-symbol").textContent = api ? "!" : "i";
+    $("tax-check-detail").textContent = api
+      ? "买卖税率未检测（不进行买卖模拟），卖出能力未验证，以上阈值不生效。仍按金额、Gas、池报价滑点与其他链上校验执行。"
+      : "链上合约监听模式使用已审核的固定税率证据。代币与 Hook 组合必须匹配审核资料，买入与卖出税率均须通过限制；未知或冲突证据拒绝。这不保证未来可卖出。";
     $("tax-buy-hint").textContent = api
       ? "API 模式未检测，税率阈值不生效"
       : "已审核的买入税率不得超过此值";
@@ -480,17 +483,17 @@
       ? "启动后第一个符合条件的新主网币，买入一次"
       : "第一个符合条件的项目，买入一次";
     $("discovery-detail").textContent = api
-      ? "自动读取官方新主网代币、池和 Hook 信息，核对链上回执，无需手填发射合约地址。"
+      ? "自动读取官方新主网代币、池和 Hook 信息并核对链上回执，无需手填发射合约、Hook 白名单或起始区块。可提前启动等待主网上线。"
       : "高级模式直接监听已核实的发射合约，需要部署资料、Hook 白名单及监控起点。";
     $("monitor-explanation").textContent = api
-      ? "启动时已可交易的主网币不会购买。包含当时仍在准备、启动后才完成部署的项目；每次继续运行会保留已有记录。"
+      ? "只处理启动后完成部署且未超过最大发射时间差的主网项目；延迟发现的旧项目会跳过。每次继续运行会保留已有记录。"
       : "启动时先核对历史；若符合条件的项目已经发射，会停止并提示已错过，不追买旧币。扫描进度会保存，更改筛选条件后会重新核对。";
     $("launch-feed-title").textContent = api ? "官方 API 发现" : "API 辅助发现";
     $("flow-discovery").textContent = api
       ? "官方 API 新主网项目 → 链上核对"
       : "监听发射合约；API 变化触发补扫";
     $("launch-feed-description").textContent = api
-      ? "发现启动后新变为可交易的主网项目，自动核对代币、池、Hook 和链上回执。全部检查通过且已启动实盘后，可直接触发买入。"
+      ? "发现新主网项目后，核对发射时间、官方身份、池和链上回执。全部检查通过且已启动实盘后，可触发一次买入；不保证首买或成交。"
       : "与链上 WebSocket 并行发现。接口变化只触发链上补扫；买入仍需官方部署核验、链上事件与筛选通过。";
   }
 
@@ -645,7 +648,7 @@
     $("deployment-detail").textContent = ready
       ? "当前配置满足服务端校验条件。真实买入需要勾选授权并启动实盘，所有交易仍需通过运行时检查。"
       : api
-        ? "API 模式自动获取项目与池信息并核对链上回执。请先配置执行钱包，实盘仍需通过下方检查并由你启动。"
+        ? "API 模式自动获取项目与池信息并核对链上回执，无需提供主网清单。请先配置执行钱包，通过下方检查后由你启动；没有新主网币时继续等待。"
         : "实盘需要官方主网地址、合约接口、RPC 与交易路径通过校验。下方检查列出当前未满足的条件。";
   }
 

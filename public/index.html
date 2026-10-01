@@ -72,7 +72,7 @@
             <div>
               <div class="eyebrow">EARLY SIGNAL. PRECISE EXECUTION.</div>
               <h1>首发监听控制台<span class="heading-dot">.</span></h1>
-              <p>设置条件，监听 IMD 新项目，在校验通过后执行首笔买入。</p>
+              <p>设置条件，监听 IMD 新项目，在校验通过后提交一次买入。</p>
             </div>
             <div class="heading-meta">
               <span class="mini-label">当前执行模式</span
@@ -367,6 +367,21 @@
                         买卖税率未检测（不进行买卖模拟），卖出能力未验证，以上阈值不生效。仍按金额、Gas、池报价滑点与其他链上校验执行。
                       </p>
                     </div>
+                    <label class="field"
+                      ><span>最大发射时间差</span>
+                      <div class="input-unit">
+                        <input
+                          id="maxLaunchAgeSeconds"
+                          name="maxLaunchAgeSeconds"
+                          type="number"
+                          min="12"
+                          max="300"
+                          step="1"
+                          required
+                        /><span>秒</span>
+                      </div>
+                      <small>从链上发射时间起计算；发现或签名前超过此时限会跳过，默认 120 秒。交易有效期也不会晚于此上限。</small></label
+                    >
                     <details class="advanced-settings filter-advanced">
                       <summary>更多筛选条件<span>＋</span></summary>
                       <div class="input-grid">
@@ -470,8 +485,7 @@
                           链上合约监听（高级）
                         </option></select
                       ><small id="discovery-detail"
-                        >自动读取官方新主网代币、池和 Hook
-                        信息，核对链上回执，无需手填发射合约地址。</small
+                        >自动读取官方新主网代币、池和 Hook 信息并核对链上回执，无需手填发射合约、Hook 白名单或起始区块。可提前启动等待主网上线。</small
                       ></label
                     >
                     <div class="rpc-explainer">
@@ -499,7 +513,7 @@
                       ></textarea
                       ><small
                         >每行一个 Ethereum
-                        主网地址。查询按顺序主备切换；广播同时发送同一笔签名交易。</small
+                        主网地址。查询按顺序主备切换；广播同时发送同一笔签名交易，不会因此多买一次。</small
                       ></label
                     >
                     <label class="field full-width"
@@ -619,8 +633,7 @@
                           >/launches 接口 ↗</a
                         >
                         <span id="launch-feed-description"
-                          >发现启动后新变为可交易的主网项目，自动核对代币、池、Hook
-                          和链上回执。全部检查通过且已启动实盘后，可直接触发买入。</span
+                          >发现新主网项目后，核对发射时间、官方身份、池和链上回执。全部检查通过且已启动实盘后，可触发一次买入；不保证首买或成交。</span
                         >
                       </p>
                       <div class="launch-feed-meta" aria-live="polite">
@@ -685,7 +698,7 @@
                       <h3 id="target-title">
                         启动后第一个<br />符合条件的新主网币
                       </h3>
-                      <p>监听 → 条件过滤 → 报价核验 → 买入</p>
+                      <p>监听 → 条件过滤 → 报价核验 → 广播买入</p>
                     </div>
                     <div class="execution-state">
                       <span id="phase-label">等待启动</span>
@@ -734,7 +747,7 @@
                     >
                       ■ 停止监听
                     </button>
-                    <p class="stop-note">停止监听不会撤销已广播的交易。</p>
+                    <p class="stop-note">多个 RPC 发送同一笔签名交易，不重签或追加买入；不保证首买或成交。停止监听不会撤销已广播的交易。</p>
                   </div>
                 </section>
 
@@ -765,13 +778,13 @@
                       <span>02</span>
                       <div>
                         <strong>核对条件与交易</strong>
-                        <p>核对链上来源、滑点与 Gas 上限</p>
+                        <p>核对发射时间、链上来源、滑点与 Gas 上限</p>
                       </div>
                     </li>
                     <li>
                       <span>03</span>
                       <div>
-                        <strong>提交并等待回执</strong>
+                        <strong>广播并等待回执</strong>
                         <p>真实状态显示在运行记录中</p>
                       </div>
                     </li>

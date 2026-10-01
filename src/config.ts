@@ -78,6 +78,7 @@ export const configSchema = z
     startBlock: blockNumber.default("0"),
     minLiquidityEth: decimal.default("0"),
     deadlineSeconds: z.number().int().min(20).max(300).default(60),
+    maxLaunchAgeSeconds: z.number().int().min(12).max(300).default(120),
     pollIntervalMs: z.number().int().min(1000).max(60000).default(2000),
   })
   .strict()

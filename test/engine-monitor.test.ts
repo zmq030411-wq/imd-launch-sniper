@@ -281,7 +281,9 @@ async function isolated(
       chain,
       saveManifest,
       engine: (config = {}, startFeed = () => () => {}) => {
-        const engine = new Engine(startFeed);
+        const engine = new Engine(startFeed, {}, {
+          now: () => Number(1_800_000_000n + chain.head * 12n) * 1000,
+        });
         engine.config = configSchema.parse({
           discoverySource: "chain",
           startBlock: "0",

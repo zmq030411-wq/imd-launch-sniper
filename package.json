@@ -13,6 +13,7 @@
     "test": "tsx --test test/*.test.ts",
     "research": "tsx scripts/research.ts",
     "wallet:import": "tsx scripts/import-wallet.ts",
+    "protocol:check": "tsx scripts/check-protocol.ts",
     "rpc:check": "tsx scripts/check-public-rpc.ts",
     "rpc:benchmark": "tsx scripts/benchmark-rpc.ts",
     "testnet": "tsx scripts/testnet-buy.ts",
